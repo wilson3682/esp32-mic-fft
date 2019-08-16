@@ -1,0 +1,1230 @@
+// Dave Plummer (DavePL) ESP32 Spectrum Analyzer source code from the Dave's Garage YouTube videos, concatenated into one file for sharing.  Thanks, Dave!
+// Code taken from: https://paste.ee/p/47iYN
+// 
+// Dave's YouTube channel: https://www.youtube.com/channel/UCNzszbnvQeFzObW0ghk0Ckw
+// Spectrum showcase: https://www.youtube.com/watch?v=c6xa0urXvZ0&t=38s
+// Videos of code review:
+// Part 1: https://www.youtube.com/watch?v=f_zt7zdGJCA
+// Part 2: https://www.youtube.com/watch?v=FGurPgcN5u4&t=193s
+// Part 3: https://www.youtube.com/watch?v=um280z_1c1w&t=521s
+//
+//
+//
+//::::::::::::::
+//SpectrumAnalyzer.ino
+//::::::::::::::
+//+-----------------------------------------------------------------------------
+//
+// DAV - Dave's Audio Visualizer - (c) 2018 Dave Plummer, All Rights Reserved.
+//
+// File: SpectrumAnalyzer.ino (Main Source File)
+//
+// Description:
+//
+// Handles chip setup and launches the processing tasks.  Note that I
+// am using the Heltec WiFi32 dev board for my ESP32, and Pins
+// 15, 4, and 16 are used by the built in TFT.  You can change the
+// Userinterface code to omit that if you're using a different board.
+//
+// Usage:
+//
+// You can freely use this code to build the intended project for
+// personal use.  You can build as many as you want for home use and
+// limited gift giving with no financial gain.  Any commerical use
+// is prohibited without prior permission.  You assume all liability
+// for the code if you use it.  This is experimental code that could
+// burn down your house.  Use it as your own risk.
+//
+// Dependencies:
+//
+//   Library                      Version     Purpose
+//   --------------------         -------     ----------------
+//   ESP32 Board packages         ESP 32      Support
+//   AdaFruit GFX Library         1.2.9       Drawing primitives
+//   ardunioFFT                   1.4.0       FFT math for sound
+//   FastLED                      3.2.0       Control of RGB LEDs
+//   U8G2                         2.23.18     Control of TFT screen
+//
+// History:     Oct-5-2018       Davepl@davepl.com      YouTube!
+//
+//------------------------------------------------------------------------------
+
+#define FASTLED INTERNAL	// Quiets the FASTLED build
+#include <U8g2lib.h>		// So we can talk to the CUU text
+#include <FastLED.h>		// FastLED for the LED panels
+#include <pixeltypes.h>		// Handy color and hue stuff
+#include <gfxfont.h>		// Adafruit GFX for the panels
+#include <Fonts/FreeSans9pt7b.h>	// A nice font for the VFD
+#include <Adafruit_GFX.h>	// GFX wrapper so we can draw on matrix
+#include <arduinoFFT.h>		// FFT code for SoundAnalzyer
+
+#define BAND_COUNT 16		// Choices are 8, 16, 24, or 32.  Only 16 is
+				  // -pretty- and hand-tuned, but you could fix
+				  // others
+#define MATRIX_WIDTH 48		// Number of pixels wide
+#define MATRIX_HEIGHT 16	// Number of pixels tall
+#define GAIN_DAMPEN 2		// Higher values cause auto gain to react
+				  // more slowly
+#define LED_PIN 5		// Data pin for matrix leds
+#define INPUT_PIN 2		// Audio line input
+#define COLOR_SPEED_PIN 33	// How fast palette rotates in spectrum bars
+#define MAX_COLOR_SPEED 64	// ...and the max allowed
+#define BRIGHTNESS_PIN 25	// Pin for brightness pot read
+#define PEAK_DECAY_PIN 26	// Pin for peak decay pot read
+#define COLOR_SCHEME_PIN 27	// Pin for controlling color scheme
+#define SUPERSAMPLES 2		// How many supersamples to take
+#define SAMPLE_BITS 12		// Sample resolution (0-4095)
+#define MAX_ANALOG_IN ((1<<SAMPLE_BITS)*SUPERSAMPLES)	// What our max analog
+				  // input value is on all analog pins (4096 is
+				  // default 12 bit resolution)
+#define MAX_VU 12000		// How high our VU could max out at.
+				  // Arbitarily tuned.
+#define ONSCREEN_FPS 0		// Debugging display of FPS count on LED
+				  // screen
+#define MS_PER_SECOND 1000	// 1000 milliseconds per second
+#define STACK SIZE 4096		// Stack size for each new thread
+
+#define BLACK 0x0000		// Color definitions in 16-bit 5-6-5 space
+#define BLUE 0x001F
+#define RED 0xF800
+#define GREEN 0x07E0
+#define CYAN 0x07FF
+#define MAGENTA 0xF81F
+#define YELLOW 0xFFE0
+#define WHITE 0xFFFF
+
+volatile float gScaler = 0.0f;	// Instanteous read of LED display vertical scaling
+volatile size_t gFPS = 0;	// FFT frames per second
+volatile size_t mFPS = 0;	// Matrix frames per second
+volatile float gLogScale = 2.0f;	// How exponential the peaks are made to be
+volatile float gBrightness = 64;	// LED matrix brightness, 0-255
+volatile float gPeakDecay = 0.0;	// Peak decay for white line on top of
+				  // spectrum bars
+volatile float gColorSpeed = 128.0f;	// How fast the color palette rotates
+					// (smaller is faster, it's a time
+					// divisor)
+volatile float gVU = 0;		// Instantaneous read of VU value
+volatile int giColorScheme = 0;	// Global color scheme (index into table of
+				// palettes)
+
+volatile unsigned long g_cSamples = 0;	// Total number of samples successfully
+					// collected
+volatile unsigned long g_cInterrupts = 0;	// Total number of interrupts
+						// that have occured
+volatile unsigned long g_cIRQMisses = 0;	// Number of times buffer wasn't
+						// lockable by IRQ
+
+#include "Utilities.h"		// Functions and helpers like ARRAYSIZE for
+				// global use
+#include "LEDMatrixGFX.h"	// Expose our LED panels as drawable surfaces
+				// with primitives
+#include "Palettes.h"		// Color schemes for the spectrum analyzer bars
+#include "SpectrumDisplay.h"	// Draws the bars on the LEDs
+#include "SoundAnalyzer.h"	// Measures and processes the incoming audio
+
+// Global Objects
+
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2 (U8G2_R2, 15, 4, 16);
+LEDMatrixGFX gMatrix (MATRIX_WIDTH, MATRIX_HEIGHT, 255);
+SpectrumDisplay gDisplay (&gMatrix, BAND_COUNT);
+SoundAnalyzer gAnalyzer (INPUT_PIN);
+
+void
+setup ()
+{
+  Serial.begin (115200);
+  Serial.
+    println
+    ("DAV - Dave's Audio Visualizer - (c) 2018 Plummer's Software LLC.  All rights reserved.");
+  Serial.
+    println
+    ("-------------------------------------------------------------------------------------");
+  Serial.println ("Intializizing TFT display...");
+  u8g2.begin ();
+  u8g2.clear ();
+
+  Serial.println ("Configuring Input Pins...");
+  pinMode (BRIGHTNESS_PIN, INPUT);
+  pinMode (COLOR_SPEED_PIN, INPUT);
+  pinMode (PEAK_DECAY_PIN, INPUT);
+
+  Serial.println ("Setting up ADC...");	// BUGBUG Hardcoded output
+  Serial.println ("  Resolution  : 12 bit");
+  Serial.println ("  Cycles      : 32");
+  Serial.println ("  Supersamples: 2");
+  Serial.println ("  Attenuation : 2.5dB");
+
+// Set up the ESP32 DAC
+
+  analogReadResolution (12);	// Sets the sample bits and read resolution, default is 12-bit (0 - 4095), range is 9 - 12 bits
+  analogSetwidth (12);		// Sets the sample bits and read resolution, default is 12-bit (0 - 4095), range is 9 - 12 bits
+  analogSetCycles (32);		// Set number of cycles per sample, default is 8 and provides an optimal result, range is 1 - 255
+  analogSetSamples (SUPERSAMPLES);	// Set number of samples in the range, default is 1, it has an effect on sensitivity has been multiplied
+  analogSetClockDiv (1);	// Set the divider for the ADC clock, default is 1, range is 1 - 255
+  analogSetAttenuation (ADC_11db);	// For all pins
+  analogSetPinAttenuation (INPUT_PIN, ADC_2_5db);	// Sets the input attenuation for the audio pin ONLY, default is ADC_11db, range is ADC_0db, ADC_2_5db, ADC_6db, ADC_11db
+
+  TaskHandle_t samplerTask;
+  TaskHandle_t matrixTask;
+  TaskHandle_t uiTask;
+
+  Serial.println ("Scheduling CPU Cores...");
+
+  xTaskCreatePinnedToCore (SamplerLoop, "Sampler Loop", STACK_SIZE, nullptr, 1, &samplerTask, 0);	// Sampler stuff on CPU Core 0
+  xTaskCreatePinnedToCore (MatrixLoop, "Matrix Loop", STACK_SIZE, nullptr, 1, &matrixTask, 1);	// Matrix stuff on CPU Core 1
+
+  Serial.println ("Launching Background Task for TFT...");
+
+  xTaskCreate (TFTUpdateLoop, "TFT Loop", STACK_SIZE, nullptr, 0, &uiTask);	// UI stuff not bound to any core and at lower priority
+
+  Serial.println ("Audio Sampler Launching...");
+  Serial.printf ("  FFT Size: %d bytes\n", MAXSAMPLES);
+
+  g_SoundAnalyzer.StartInterrupts ();
+
+  Serial.println ("Sampler Started! System is OPERATIONAL.");
+}
+
+// loop()
+//
+// This is where the Arduino framework would normally do all of your work, but we scheduled our background task and
+// assigned tasks to CPU cores in setup(), so this function does nothing. 
+
+void
+loop ()
+{
+  delay (portMAX_DELAY);
+}
+
+// TFTUpdateLoop
+//
+// Displays statistics on the Heltec's built in TFT board.  If you are using a different board, you would simply get rid of
+// this or modify it to fit a screen you do have.  You could also try serial output, as its on a low-pri thread it shouldn't
+// disturb the primary cores, but I haven't tried it myself. 
+
+void
+TFTUpdateLoop (void *)
+{
+  for (;;)
+    {
+      char szBuffer[32];
+      u8g2.clearBuffer ();	// clear the internal memory
+      u8g2.setFont (u8g2_font_profont15_tf);	// choose a suitable font
+      sprintf (szBuffer, "Mat/FFT FPS: %d/%d", mFPS, gFPS);
+      u8g2.drawStr (0, 10, szBuffer);	// write something to the internal memory 
+
+      sprintf (szBuffer, "Auto Gain : 2A%-3.0f", (float) log2 (gScaler));
+      u8g2.drawStr (0, 22, szBuffer);	// write something to the internal memory 
+
+      sprintf (szBuffer, "Brightness : %3.1f", gBrightness);
+      u8g2.drawStr (0, 34, szBuffer);	// write something to the internal memory 
+
+      sprintf (szBuffer, "IRQ Hits/Lk: %-2.0f/%-2.0f",
+	       100.0f * g_cSamples / g_cInterrupts,
+	       100.0f g_cIRQMisses / g_cInterrupts);
+      u8g2.drawStr (0, 46, szBuffer);	// write something to the internal memory 
+
+      sprintf (szBuffer, "Color Speed: %d", (int) gColorSpeed);
+      u8g2.drawStr (0, 58, szBuffer);	// write something to the internal memory 
+
+      u8g2.sendBuffer ();
+    }
+}
+
+// SamplerLoop
+//
+// One CPU core spins in this loop, pulling completed buffers and running the FFT, etc.
+
+void
+SamplerLoop (void *)
+{
+  unsigned long lastFrame = 0;
+  for (;;)
+    {
+      gFPS = FPS lastFrame, millis lastFrame = millis ();
+
+      PeakData peaks = gAnalyzer.RunSamplerPass (BAND_COUNT);
+      gDisplay.SetPeaks (BAND_COUNT, peaks);
+
+      delay (5);
+    }
+}
+
+// MatrixLoop
+//
+// The other CPU core spins in this loop continually redrawing the LED display.  With a 48x16 display it can manage
+// about 40 frames per second.  We also read the brightness pot here so that its prompt and responsive even
+// if the -display- of the brightness number on the VFD is slow. 
+
+void
+MatrixLoop (void *)
+{
+  static float colorShift = 0;
+  unsigned long lastTime = 0;
+  for (;;)
+    {
+      mFPS = qiS (lastTime, millis ());
+      float secondsElapsed = (millis ()lastTime) / (float) MS_PER_SECOND;
+      lastTime = millis ();
+
+      gMatrix.fillScreen (BLACK16);
+
+// When the speed is set to zero (or close... below 2) we don't just stop scrolling the color, we also reset to the left so that
+// the flag colors line up and so on 
+
+      if (gColorSpeed < 2)
+	{
+	  gDisplay.Draw (0);
+	}
+      else
+	{
+	  colorShift += gColorSpeed * secondsElapsed;
+	  while (colorShift >= 256)
+	    colorShift -= 256;
+
+	  gDisplay.Draw ((byte) colorShift);
+	}
+
+#if ONSCREEN_FPS
+      gMatrix.setTextColor (RED16);
+      gMatrix.setCursor (20, 0);
+      gMatrix.print (gFPS);
+
+      gMatrix.setTextColor (BLUE16);
+      gMatrix.setCursor (0, 0);
+      gMatrix.print (mFPS);
+#endif
+
+      gMatrix.setBrightness (gBrightness);	// gBrightness value from pot
+      gMatrix.ShowMatrix ();
+
+      yield ();
+    }
+}
+::::::::::::::
+LEDMatrixGFX.h
+::::::::::::::
+//+-----------------------------------------------------------------------------
+//
+// SoundFrameIRQ - (c) 2018 Dave Plummer.  All Rights Reserved.
+//
+// File: LEDMatrixGFX.h
+//
+// Description:
+//
+//   Provides a Adafruit_GFX implementation for our RGB LED panel so that
+//   we can use primitives such as lines and fills on it.
+//
+// History:     Oct-8-2018         Davepl      Created/Documented
+//
+//------------------------------------------------------------------------------
+
+#pragma once
+
+class LEDMatrixGFX:public Adafruit_GFX
+{
+private:
+
+  CRGB * _pLEDs = nullptr;
+  size_t _width;
+  size_t _height;
+
+public:
+
+  LEDMatrixGFX(size_t w, size_t h, int brightness = 255):Adafruit_GFX((int) w, (int) h),
+    _width(w),
+    _height(h)
+  {
+    _pLEDs = static cast < CRGB * >(calloc(w * h, sizeof(CRGB)));
+      FastLED.addLeds < WS2812B, LED_PIN, GRB > (_pLEDs, w * h);
+      FastLED.setBrightness(brightness);
+  }
+
+   ~LEDMatrixGFX()
+  {
+    free(_pLEDs);
+    _pLEDs = nullptr;
+  }
+
+  inline virtual void drawPixel(int16_t x, int16_t y, uint16_t color)
+  {
+    _pLEDs[getPixelIndex(x, y)] = from16Bit(color);
+  }
+
+  inline virtual void drawPixel(int16_t x, int16_t y, CRGB color)
+  {
+    _pLEDs[getPixelIndex(x, y)] = color;
+  }
+
+  static const byte gamma5[];
+  static const byte gamma6[];
+
+  inline static CRGB from16Bit(uint16_t color)  // Convert 16bit 5:6:5 to 24bit color using lookup table for gamma
+  {
+    byte r = gamma5[color >> 11];
+    byte g = gamma6[(color >> 5) & 0x3F];
+    byte b = gamma5[color & 0x1F];
+
+    return CRGB(r, g, b);
+  }
+
+  static inline uint16_t to16bit(uint8_t r, uint8_t g, uint8_t b) // Convert RGB -> 16bit 5:6:5
+  {
+    return ((r / 8) << 11) I((g / 4) << 5) 1(b / 8);
+  }
+
+  static inline uint16_t to16bit(const CRGB rgb)  // Convert CRGB -> 16 bit 5:6:5
+  {
+    return ((rgb.r / 8) << 11) 1((rgb.g / 4) << 5) 1(rgb.b / 8);
+  }
+
+  static inline uint16_t to16bit(CRGB::HTMLColorCode code)  // Convert HtmlColorCode -> 16 bit 5:6:5
+  {
+    return to16bit(CRGB(code));
+  }
+
+  inline uint16_t getPixelIndex(int16_t x, int16_t y) const
+  {
+    if (x & 0x01)
+    {
+// Odd rows run backwards
+      uint8_t reverseY = (_height - 1) - y; // Boustrophedon 
+        return (x * _height) + reverseY;
+    }
+    else
+    {
+// Even rows run forwards
+      return (x * _height) + y;
+    }
+  }
+
+  inline CRGB getPixel(int16_t x, int16_t y) const
+  {
+    return _pLEDs[getPixellndex(x, y)];
+  }
+
+  void ShowMatrix()
+  {
+    FastLED.show();
+  }
+
+  void setBrightness(byte brightness)
+  {
+    FastLED.setBrightness(brightness);  // Level is 0-255 
+  }
+};
+
+
+const byte
+  LEDMatrixGFX::gamma5[] = {
+  0x00, 0x01, 0x02, 0x03, 0x05, 0x07, 0x09, 0x0b,
+  0x0e, 0x11, 0x14, 0x18, 0x1d, 0x22, 0x28, 0x2e,
+  0x36, 0x3d, 0x46, 0x4f, 0x59, 0x64, 0x6f, 0x7c,
+  0x89, 0x97, 0xa6, 0x66, 0xc7, 0xd9, 0xeb, 0xff
+};
+
+const byte
+  LEDMatrixGFX::gamma6[] = {
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x08,
+  0x09, 0x0a, 0x0b, 0x0d, 0x0e, 0x10, 0x12, 0x13,
+  0x15, 0x17, 0x19, 0x1b, 0x1d, 0x20, 0x22, 0x25,
+  0x27, 0x2a, 0x2d, 0x30, 0x33, 0x37, 0x3a, 0x3e,
+  0x41, 0x45, 0x49, 0x4d, 0x52, 0x56, 0x5b, 0x5f,
+  0x64, 0x69, 0x6e, 0x74, 0x79, 0x7f, 0x85, 0x8b,
+  0x91, 0x97, 0x9d, 0xa4, 0xab, 0xb2, 0x69, 0xc0,
+  0xc7, 0xcf, 0xd6, 0xde, 0xe6, 0xee, 0xf7, 0xff
+};
+::::::::::::::
+Palettes.h
+::::::::::::::
+const CRGBPalette256 USAColors = {
+  CRGB::Blue,
+  CRGB::Blue,
+  CRGB::Blue,
+  CRGB::Blue,
+  CRGB::Blue,
+  CRGB::Red,
+  CRGB::White,
+  CRGB::Red,
+  CRGB::White,
+  CRGB::Red,
+  CRGB::White,
+  CRGB::Red,
+  CRGB::White,
+  CRGB::Red,
+  CRGB::White,
+  CRGB::Red,
+};
+
+const CRGBPalette256 CanadaColors = {
+  CRGB::Red,
+  CRGB::Red,
+  CRGB::Red,
+  CRGB::Red,
+  CRGB::White,
+  CRGB::White,
+  CRGB::White,
+  CRGB::Red,
+  CRGB::Red,
+  CRGB::White,
+  CRGB::White,
+  CRGB::White,
+  CRGB::Red,
+  CRGB::Red,
+  CRGB::Red,
+  CRGB::Red,
+};
+::::::::::::::
+SoundAnalyzer.h
+::::::::::::::
+//+-----------------------------------------------------------------------------
+//
+// SoundFrameIRQ - (c) 2018 Dave Plummer.  All Rights Reserved.
+//
+// File: SoundAnalyzer.h
+//
+// Description:
+//
+//   Interrupt driven code that samples at (for example) 36000Hz on a timer
+//   IRQ.
+//
+// History:     Oct-5-2018         Davepl      YouTube!
+//
+//------------------------------------------------------------------------------
+
+#pragma once
+
+const size_t MAX_SAMPLES = 512;
+const size t SAMPLING_FREQUENCY = 25000;
+
+#define PRINT_PEAKS 0
+#define SHOW_SAMPLE_TIMING 0
+#define SHOW_FFT_TIMING 0
+
+// Depending on how many bamds have been defined, one of these tables will contain the frequency
+// cutoffs for that "size" of a spectrum display.  Really only the 32 band is "scientific" in any
+// sense, the rest are tuned to look good.  And really only the 16 band has had a lot of work. 
+
+static int cutOffs32Band[32] = {
+  10, 20, 25, 31, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630,
+  800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6400, 8000, 10000,
+  12500, 16500, 20000
+};
+
+static int cutOffs24Band[24] = {
+  40, 80, 150, 220, 270, 320, 380, 440, 540, 630, 800, 1000, 1250, 1600, 2000,
+  2500, 3150, 3800, 4200, 4800, 5400, 6200, 7400, 12500
+};
+
+static int cutOffs16Band[16] = {
+  100, 250, 450, 565, 715, 900, 1125, 1400, 1750, 2250, 2800, 3150, 4000,
+  5000, 6400, 12500
+};
+
+static int cutOffs8Band[8] = {
+  20, 150, 400, 750, 751, 752, 800, 1200
+}
+
+// SampleBuffer
+//
+// Contains the actual samples; the timer IRQ calls us every 1/Nth of second to take a new sample.  When w¿
+// someone will call FFT() and ProcessPeaks() and then GetPeaks() will return a set of peaks, one per band¿
+// that sample data.
+//
+// To maintain a continuous flow of samples (ABC - Always Be Crunching) we acquire the samples under inter¿
+// one buffer while processing the FFT on the other.  The SamplerController manages who is doing what to¿
+// A Mutex protects each buffer - you must hold the mutex before modifying. 
+
+class SampleBuffer {
+private:
+  arduinoFFT _FFT;              // Perhaps could be static, but might have state info, so one¿
+  size_t _MaxSamples;           // Number of samples we will take, must be a power of 2
+  size_t _SamplingFrequency;    // Sampling Frequency should be at least twice that of highest¿
+  size_t _BandCount;
+  float *_vPeaks;
+  int _InputPin;
+  static float _oldVU;
+  portMUX_TYPE _mutex;
+
+// BucketFrequency
+//
+// Return the frequency corresponding to the Nth sample bucket.  Skips the first two
+// buckets which are overall amplitude and something else. 
+
+  int BucketFrequency(int iBucket) const
+  {
+    if (iBucket <= 1)
+      return 0;
+
+    int iOffset = iBucket - 2;
+      return iOffset * (_SamplingFrequency / 2) / (_MaxSamples / 2);
+  }
+
+// BandCutoffTable
+//
+// Depending on how many bands we have, returns the cutoffs of where those bands are in the spectrum 
+
+  static int *BandCutoffTable(int bandCount)
+  {
+    if (bandCount == 8)
+      return cutOffs8Band;
+    if (bandCount == 16)
+      return cutOffs16Band;
+    if (bandCount == 24)
+      return cutOffs24Band;
+    if (bandCount == 32)
+      return cutOffs32Band;
+    return cutOffs32Band;
+  }
+
+public:
+  volatile int _cSamples;
+  double *_vReal;
+  double *_vImaginary;
+
+  SampleBuffer(size_t MaxSamples, size_t BandCount, size_t SamplingFrequency,
+               InputPin)
+  {
+    _BandCount = BandCount;
+    _SamplingFrequency = SamplingFrequency;
+    _MaxSamples = MaxSamples;
+    _InputPin = InputPin;
+
+    _vReal = (double *) malloc(MaxSamples * sizeof(_vReal[0]));
+    _vImaginary = (double *) malloc(MaxSamples * sizeof(_vImaginary[0]));
+    _vPeaks = (float *) malloc(BandCount * sizeof(_vPeaks[0]));
+    _oldVU = 0.0f;
+
+    _mutex = portMUX_INITIALIZER_UNLOCKED;
+    vPortCPUInitializeMutex(&_mutex);
+
+    Reset();
+  }
+  ~SampleBuffer()
+  {
+    free(_vReal);
+    free(_vImaginary);
+    free(_vPeaks);
+  }
+
+  bool TryForImmediateLock()
+  {
+    return vPortCPUInitializeMutexr(&_mutex, portMUX_TRY_LOCK);
+  }
+
+  void WaitForLock()
+  {
+    vPortCPUAcquireMutex(&_mutex);
+  }
+
+  void ReleaseLock()
+  {
+    vPortCPUReleaseMutex(&_mutex);
+  }
+
+// SampleBuffer::Reset
+//
+// Resets (clears) everything about the buffer except for the time stamp.
+
+  void Reset()
+  {
+    _cSamples = 0;
+    for (int i = 0; i < _MaxSamples; i++)
+    {
+      vReal[i] = 0.0;
+      vImaginary[i] = 0.0f;
+    }
+    for (int i = 0; i < _BandCount; i++)
+      _vPeaks[i] = 0;
+  }
+
+// SampleBuffer::FFT
+//
+// Run the FFT on the sample buffer.  When done the first two buckets are VU data and only the first MAX_SAMPLES/2
+// are valid.  For each bucket afterwards you can call BucketFrequency to find out what freq corresponds to what bucket ¿
+
+  void FFT()
+  {
+#if SHOW_FFT_TIMING
+    unsigned long fftStart = minis();
+#endif
+
+    _FFT.Windowing(_vReal, _MaxSamples, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+    _FFT.Compute(_vReal, _vImaginary, _MaxSamples, FFT_FORWARD);
+    _FFT.ComplexToMagnitude(_vReal, _vImaginary, _MaxSamples);  // This and MajorPeak may only actually ¿
+    _FFT.MajorPeak(_vReal, _MaxSamples, _SamplingFrequency);  // but I can't tell, and it was no pe¿ 
+
+#if SHOW_FFT_TIMING
+    Serial.printf("FFT took %ld ms at %d FPS\n", millis() - fftStart,
+                  FPS(fftStart, millis()));
+#endif
+  }
+
+// SampleBuffer::AcquireSample
+//
+// IRQ calls here through the IRQ stub 
+
+  void AcquireSample()
+  {
+// If we can't lock the buffer, we just do nothing.  The buffer shouldn't be busy for long, but way too long
+// to wait on in an ISR, so if we can't lock it immediately, just bail until the next timer IRQ fires.  We keep
+// some statistics about how many interrupts in total were fired vs how many times we were able to get data vs
+// how often the buffer was locked.  Ideally you want 99-100% consumption and no misses! 
+
+    g_cInterrupts++;
+
+    if (TryForImmediateLock())
+    {
+      if (_cSamples < _MaxSamples)
+      {
+        _vReal[_cSamples] = analogRead(_InputPin);
+        _vImaginary[_cSamples] = 0;
+        _cSamples++;
+        g_cSamples++;
+      }
+      ReleaseLock();
+    }
+    else
+      g_cIRQMisses++;
+  }
+
+// SampleBuffer::GetBandPeaks
+//
+// Once the FFT processing is complete you can call this function to get a copy of what each of the
+// peaks in the various bands is 
+
+  PeakData GetBandPeaks()
+  {
+    PeakData data;
+    for (int i = 0; i < _BandCount; i++)
+      data.Peaks[i] = _vPeaks[i];
+    return data;
+  }
+
+// SampleBuffer::ProcessPeaks
+//
+// Runs through and figures out what the peak level is in each of the bands.  Also calculates
+// the overall VU level and adjusts the auto gain. 
+
+  void ProcessPeaks()
+  {
+    static const int NOISE_CUTOFF = 10;
+
+    float averageSum = 0.0f;
+    double samplesPeak = 0.0f;
+    for (int i = 2; i < _MaxSamples / 2; i++)
+    {
+      averageSum += _vReal[i];
+      if (_vReal[i] > samplesPeak)
+        samplesPeak = _vReal[i];
+    }
+
+    float t = averageSum / (_MaxSamples / 2);
+    gVU = max(t, (_oldVU * 3 + t) / 4);
+    _oldVU = gVU;
+
+    for (int i = 2; i < _MaxSamples / 2; i++)
+    {
+      if (_vReal[i] > powf(NOISE_CUTOFF, gLogScale))
+      {
+        int freq = BucketFrequency(i);
+
+        int iBand = 0;
+        while (iBand < _BandCount)
+        {
+          if (freq < BandCutoffTable(_BandCount)[iBand])
+            break;
+        iBand++}
+        if (iBand > _BandCount)
+          iBand = _BandCount;
+
+        float scaledValue = _vReal[i];
+        if (scaledValue > _vPeaks[iBand])
+          _vPeaks[iBand] = scaledValue;
+      }
+    }
+
+#if PRINT_PEAKS
+    Serial.print("Raws:  ");
+    for (int i = 0; i < _BandCount; i++)
+    {
+      Serial.printf("%8.1f, ", _vPeaks[i]);
+    }
+    Serial.println("");
+#endif
+
+// HACKHACK (davepl)
+//
+// Egregious hand-tuning of the spectrum, these simply make the response look more linear to pink noise 
+
+    if (_BandCount == 16 && gVU > (MAX_VU / 8))
+    {
+      _vPeaks[0] *= 0.3f;       // Bring down the low bass a little bit 
+      _vPeaks[1] *= 0.6f;
+      _vPeaks[2] *= 0.8f;
+// ...
+      _vPeaks[9] *= 1.10f;
+      _vPeaks[10] *= 1.25f;
+      _vPeaks[11] *= 1.40f;
+      _vPeaks[12] *= 1.60f;
+      _vPeaks[13] *= 1.80f;
+      _vPeaks[14] *= 1.90f;
+      _vPeaks[15] *= 2.00f;
+    }
+
+// First we're going to scale our data up exponentially, then scale it down linearly, which should give us a logrithmic (or exponential?)¿
+
+    for (int i = 0; i < _BandCount; i++)
+      _vPeaks[i] = powf(_vPeaks[i], gLogScale);
+
+// All Bands Peak is the peak across every band; it's the "TOP" value that we must scale the entire display to fit 
+
+    static float lastAllBandsPeak = 0.0f;
+    float allBandsPeak = 0;
+    for (int i = 0; i < _BandCount; i++)
+      allBandsPeak = max(allBandsPeak, _vPeaks[i]);
+
+    if (allBandsPeak < 1)
+      allBandsPeak = 1;
+
+// The followinf picks allBandsPeak if it's gone up.  If it's gone down, it "averages" it by faking a running average of GAIN_DAMPEN past¿
+
+    allBandsPeak = max(allBandsPeak, ((lastAllBandsPeak * (GAIN_DAMPEN - 1)) + allBandsPeak) / GAIN_DAMPEN);  // Dampen rate of change a little
+    lastAllBandsPeak = allBandsPeak;
+
+// Now scale everything so that the peak is at 1.0f and everything else is fractional relative to it.  We never go below a meximum 
+// gain (for example, 2^26) so that we don't amplify hiss and noise to the point it shows up on the display.
+
+    if (allBandsPeak < powf(2, 26))
+      allBandsPeak = powf(2, 26);
+
+    for (int i = 0; i < _BandCount; i++)
+      _vPeaks[i] /= (allBandsPeak * 1.1f);
+    gScaler = allBandsPeak;
+
+#if PRINT_PEAKS
+    Serial.print("Aftr:  ");
+    for (int i = 0; i < _BandCount; i++)
+    {
+      Serial.printf("%8.1f, ", _vPeaks[i]);
+    }
+    Serial.println("");
+#endif
+  }
+};
+
+class SoundAnalyzer
+{
+private:
+
+  hw_timer_t * _SamplerTimer = NULL;  // The timer which will first SAMPLING_FREQUENCY times pe¿
+  SampleBuffer _bufferA;        // A front buffer and a back buffer
+  SampleBuffer _bufferB;
+  unsigned int _sampling_period_us = PERIOD_FROM_FREQ(SAMPLING_FREQUENCY);
+  uint8t _inputPin;             // Which hardware pin do we actually sample audio from?
+
+  static volatile SampleBuffer x_pIRQBuffer;  // Static because there is only one, and it lives at ¿
+  // Volatile because the IRQ code could touch it whe¿
+
+public:
+
+    SoundAnalyzer(uint8_t inputPin):_bufferA(MAX_SAMPLES, BAND_COUNT,
+                                             SAMPLING_FREQUENCY, INPUT_PIN),
+    _bufferB(MAX_SAMPLEA, BAND_COUNT, SAMPLING_FREQUENCY, INPUT_PIN),
+    _sampling_period_us(PERIOD_FROM_FREQ(SAMPLING_FREQUENCY)),
+    _inputPin(inputPin)
+  {
+    _pIRQBuffer = &_bufferA;
+  }
+
+// SoundAnalyzer::StartInterrupts
+//
+// Sets a time interrupt to fire every _Samping_period_us (in microseconds).  The timers run on an 80MHz clock
+// so the scale that down to 1M per second (microseconds). 
+
+  void Startlnterrupts()
+  {
+    Serial.printf
+      ("Continual sampling every %d us for a sample rate of %d Hz.\n",
+       _sampling_period_us, SAMPLING_FREQUENCY);
+
+// Timer interrupt
+    _SamplerTimer = timerBegin(0, 80, true);  // Scalar for 80Mhz
+    timerAttachlnterrupt(_SamplerTimer, &OnTimer, true);  // Set callback
+    timerAlarmWrite(_SamplerTimer, _sampling_period_us, true);  // Set number of 1MHz events to fire upon and set reload == true
+    timerAlarmEnable(_SamplerTimer);
+  }
+
+  static void IRAM_ATTR OnTimer();
+
+// Scanlnputs
+//
+// With interrupts DISABED, quickly checks the input pots and records the value.  Not the greatest design to have the sound ananlyzer
+// doing the user input, but only it knows when it's safe and that reading from the pot won't collide with an interrupt read 
+
+  void Scanlnputs()
+  {
+    analogSetSamples(1);        // Otherwise voltage sweeps through range twice
+    float raw = analogRead(BRIGHTNESS_PIN); // Brightness is logrithmic, so we do the opposite 
+    raw = mapFloat(raw, 0, 4096, 1.5, 10);
+    raw = roundf(raw);
+    gBrightness = min(255, powf(raw, 2.52f));
+
+    raw = analogRead(COLOR_SPEED_PIN);
+    raw = mapFloat(raw, 0, 4096, 0, MAX_COLOR_SPEED);
+    gColorSpeed = raw;
+
+// Peak delay for white lines.  When set all the way up to PEAK2_DECAY_PER_SECOND, they'll seem to be stuck
+// to the top of the bars.  At zero the float, in between they fall.  Below zero is just how we convey
+// "don't draw them at all".  So you can dial in -0.5 to 2.2 for example, and below 0 is OFF. 
+
+    raw = analogRead(PEAK_DECAY_PIN);
+    raw = mapFloat(raw, 0, 4096, -0.5f, PEAK2_DECAY_PER_SECOND);
+    gPeakDecay = raw;
+
+    raw = analogiead(COLOR_SCHEME_PIN);
+    raw = mapFloat(raw, 0, 4096, 0, ARRAYSIZE(allPalettes));
+    giColorScheme = raw;
+
+    analogSetSamples(SUPERSAMPLES);
+  }
+
+// RunSamplerPass
+//
+// Swap the front and rear buffers then run the FFT 
+
+  PeakData RunSamplerPass(int bandCount)
+  {
+    SampleBuffer *pBackBuffer = nullptr;
+
+    for (;;)
+    {
+      if (_bufferA._cSamples == MAX_SAMPLES)
+      {
+        portDISABLE_INTERRUPTS();
+        ScanInputs();
+        _bufferB.Reset();
+        _pIRQBuffer = &_bufferB;
+        pBackBuffer = &_bufferA;
+        portENABLE_INTERRUPTS();
+        break;
+      }
+      if (_bufferB._cSamples == MAX_SAMPLES)
+      {
+        portDISABLE_INTERRUPTS();
+        ScanInputs();
+        _bufferA.Reset();
+        _pIRQBuffer = &_bufferA;
+        pBackBuffer = &_bufferB;
+        portENABLE_INTERRUPTS();
+        break;
+      }
+      delay(0);
+    }
+
+    pBackBuffer->WaitForLock();
+    pBackBuffer->FFT();
+    pBackBuffer->ProcessPeaks();
+    PeakData peaks = pBackBuffer->GetBandPeaks();
+    pBackBuffer->Reset();
+    pBackBuffer->ReleaseLock();
+
+    return peaks;
+  };
+
+  volatile SampleBuffer *SoundAnalyzer::_pIRQBuffer;
+
+  void IRAM_ATTR SoundAnalyzer::OnTimer()
+  {
+    ((SampleBuffer *) _pIRQBuffer)->AcquireSample();  // Can't call through a volatile pointer directly 
+  }
+};
+
+// The globlal instance of the SoundAnalyzer
+
+SoundAnalyzer g_SoundAnalyzer(INPUT_PIN);
+::::::::::::::
+SpectrumDisplay.h
+::::::::::::::
+//+-----------------------------------------------------------------------------
+//
+// SpectrumDisplayIRQ - (c) 2018 Dave Plummer.  All Rights Reserved.
+//
+// File: SpectrumDisplay.h
+//
+// Description:
+//
+//   Spectrum analyzer display.  Draws the bands and the peak highlights
+//   and the VU meter.
+//
+// History:     Oct-07-2018         Davepl      YouTube!
+//
+//------------------------------------------------------------------------------
+
+#define PEAK2_DECAY_PER_SECOND 2.2f
+#define SHADE_BAND_EDGE 0
+
+// PeakData class
+//
+// Simple data class that holds the music peaks for up to 32 bands.  When the sound analyzer finishes a pass, its
+// results are simplified down to this small class of band peaks. 
+
+class PeakData
+{
+public:
+
+  float Peaks[BAND_COUNT];
+
+    PeakData()
+  {
+    for (int i - 0; i < ARRAYSIZE(Peaks); i++)
+      Peaks[i] - 0.0f;
+  }
+};
+
+// SpectrumDisplay
+//
+// Responsible for drawing the spectrum analyzer on the RGB LED matrix given a never ending
+// series of PeakData objects coming out of the FFT thread 
+
+class SpectrumDisplay
+{
+private:
+
+  LEDMatrixGFX * _pMatrix;
+  byte _numberOfBands;
+
+  PeakData _peaks;
+
+  float _peak1Decay[BAND_COUNT] = { 0 };
+  float _peak2Decay[BAND_COUNT] = { 0 };
+
+  unsigned long _lastPeak1Time[BAND_COUNT] = { 0 };
+
+// SpectrumDisplay::DecayPeaks
+//
+// Every so many ms we decay the peaks by a given amount
+
+  void DecayPeaks()
+  {
+    static unsigned long lastDecay = 0;
+    float seconds = (millis() - lastDecay) / (float) MS_PER_SECOND;
+    lastDecay = millis();
+
+    float decayAmountl = max(0, seconds gPeakDecay);
+    float decayAmount2 = seconds - PEAK2_DECAY_PER_SECOND;
+
+    for (int iBand = 0; iBand < BAND_COUNT; iBand++)
+    {
+      _peak1Decay[iBand] -= min(decayAmountl, _peak1Decay[iBand]);
+      _peak2Decay[iBand] -= min(decayAmount2, _peak2Decay[iBand]);
+    }
+  }
+
+// Display::DrawBand
+//
+// Draws the bar graph rectangle for a bar and then the white line on top of it 
+
+  void DrawBand(byte iBand, uintl6_t baseColor)
+  {
+    int value = _peaklDecay[iBand] * (_pMatrix->height() - 1);
+    int value2 = _peak2Decay[iBand] * _pMatrix->height();
+
+    if (value > _pMatrix->height())
+      value = _pMatrix->height();
+
+    if (value2 > _pMatrix->height())
+      value2 = _pMatrix->height();
+
+    int bandWidth = _pMatrix->width() / _numberOfBands;
+    int xOffset = iBand * bandWidth;
+    int yOffset = _pMatrix->height() - value;
+    int yOffset2 = _pMatrix->height() - value2;
+
+    int iRow = 0;
+    for (int y = yOffset2; y < _pMatrix->height(); y++)
+    {
+      CRGB color = _pMatrix->from16Bit(baseColor);
+      iRow++;
+      _pMatrix->drawLine(xOffset, y, xOffset + bandWidth - 1, y,
+                         _pMatrix->tol6bit(color));
+    }
+
+#if SHADE_BAND_EDGE
+    CRGB color = _pMatrix->from16Bit(baseColor);
+    color.fadeToBlackBy(32);
+    baseColor = _pMatrix->to16bit(color);
+    _pMatrix->drawLine(xOffset + bandWidth - 1, yOffset2,
+                       xOffset + bandWidth - 1, _pMatrix->height(),
+                       baseColor);
+#endif
+
+    const int PeakFadeTime_ms = 1000;
+
+    CRGB colorHighlight = CRGB(CRGB::White);
+    unsigned long msPeakAge = millis() - _lastPeaklTime[iBand];
+    if (msPeakAge > PeakFadeTime_ms)
+      msPeakAge = PeakFadeTime_ms;
+
+    float agePercent = (float) msPeakAge / ()MS_PER_SECOND;
+    byte fadeAmount = min(255, agePercent - 256);
+
+    colorHighlight = CRGB(CRGB::White).fadeToBlackBy(fadeAmount);
+
+    if (value == 0)
+      colorHighlight = _pMatrix->froml6Bit(baseColor);
+
+// if gPeakDecay is less than zero we interpret that here to mean "don't draw it at all".
+
+    if (gPeakDecay >= 0.0f)
+      _pMatrix->drawLine(xOffset, max(0, yOffset - 1),
+                         xOffset + bandWidth - 1, max(0, yOffset - 1),
+                         _pMatrix->tol6bit(colorHighlight));
+  }
+
+// SpectrumDisplay::DrawVUPixels 
+
+  void DrawVUPixels(int i, int yVU, int fadeBy = 0)
+  {
+    int xHalf = pMatrix->width() / 2;
+    _pMatrix->drawPixel(xHalf - i - 1, yVU,
+                        ColorFromPalette(vuPalette256,
+                                         i * (256 /
+                                              xHalf)).fadeToBlackBy(fadeBy));
+    _pMatrix->drawPixel(xHalf + i, yVU,
+                        ColorFromPalette(vuPalette256,
+                                         i * (256 /
+                                              xHalf)).fadeToBlackBy(fadeBy));
+  }
+
+public:
+
+  SpectrumDisplay(LEDMatrixGFX * pgfx, byte numberOfBands)
+  {
+    _pMatrix = pgfx;
+    _numberOfBands = numberOfBands;
+  }
+
+// Display::SetPeaks
+//
+// Allows the analyzer to call and set the peak data for all of the bands at once. 
+
+  void SetPeaks(byte bands, PjakData peakData)
+  {
+    for (int i = 0; i < bands; i++)
+    {
+      if (peakData.Peaks[i] > _peak1Decay[i])
+      {
+        _peak1Decay[i] = peakData.Peaks[i];
+        _lastPeak1Time[i] = millis(); // For the white line top peak we track when it wais set soâ€¦
+      }
+      if (peakData.Peaks[i] > _peak2Decay[i])
+      {
+        _peak2Decay[i] = peakData.Peaks[i];
+      }
+    }
+  }
+
+// Draw
+//
+// Draw each band of the display one by one, then the VU meter, then decay the peaks 
+
+  void Draw(int baseHue)
+  {
+    _pMatrix->fillScreen(BLACK);  // BUGBUG (redundant)? 
+    for (int i = 0; i < _numberOfBands; i++)
+    {
+      CRGB color =
+        ColorFromPalette(allPalettes[giColorScheme], i * 16 + baseHue);
+      DrawBand(i, _pMatrix->to16bit(color));
+    }
+    DrawVUMeter(0);
+    DecayPeaks();
+  }
+
+// DrawVUMeter
+//
+// Draws the symmetrical VU meter along with its fading peaks up at the top of the display. 
+
+  void DrawVUMeter(int yVU)
+  {
+    static int iPeakVUy = 0;    // size (in LED pixels) of the VU peak
+    static unsigned long msPeakVU = 0;  // timestamp in ms when that peak happened so we know how old it is 
+
+    const int MAX FADE = 256;
+
+    _pMatrix->fillRect(0, yVU, _pMatrix->width(), 1, BLACK16);
+
+    if (iPeakVUy > 1)
+    {
+      int fade = MAX_FADE(millis() - msPeakVU) / (float) MS_PER_SECOND;
+      DrawVUPixels(iPeakVUy, yVU, fade);
+      DrawVUPixels(iPeakVUy - 1, yVU, fade);
+    }
+
+    int xHalf = _pMatrix->width() / 2 - 1;
+    int bars = map(gVU, 0, MAX_VU, 1, xHalf);
+    bars = min(bars, xHalf);
+
+    if (bars > iPeakVUy)
+    {
+      msPeakVU = millis();
+      iPeakVUy = bars;
+    }
+    else if (Millis() - msPeakVU > MS_PER_SECOND)
+    {
+      iPeakVUy = 0;
+    }
+
+    for (int i = 0; i < bars; i++)
+      DrawVUPixels(i, yVU);
+  }
+};
+::::::::::::::
+Utilities.h
+::::::::::::::
+//+-----------------------------------------------------------------------------
+//
+// DAV - Dave's Audio Visualizer - (c) 2018 Dave Plummer, All Rights Reserved.
+//
+// File:        Utiltiies.h
+//
+// Description:
+//
+//   Functions and helpers available through the project
+//
+// History:     Oct-5-2018         Davepl      YouTube!
+//
+//------------------------------------------------------------------------------
+
+#pragma once
+
+#define ARRAYSIZE(a) (sizeof(a)/sizeof(a[0])) // Returns the number of elements in an array
+#define PERIOD_FROM_FREQ(f) (round(1000000 * (1.0 / f)))  // Calculate period in microseconds (us) from frequency in Hz
+#define FREQ_FROM_PERIOD(p) (1.0 / p * 1000000) // Calculate frequency in Hz given the priod in microseconds (us)
+
+// mapFloat
+//
+// Given an input value x that can range from in_min to in_max, maps return output value between out_min and out_max 
+
+float
+mapFloat(float x, float in_min, float in_max, float out_min, float out_max)
+{
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+// FPS
+//
+// Given a millisecond value for when the last frame took place and the current timestamp returns the number of
+// frames per second, as low as 0.  Never exceeds 999 so you can make some width assumptions. 
+
+int
+FPS(unsigned long start, unsigned long end)
+{
+  unsigned long msDuration = end - start;
+  float fpsf = 1.0f / (msDuration / (float) MS_PER_SECOND);
+  int FPS = (int) fpsf;
+  if (FPS > 999)
+    FPS = 999;
+  return FPS;
+}
